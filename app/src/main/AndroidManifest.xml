@@ -43,6 +43,34 @@
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- OAuth callback handler for SSO deep links -->
+        <activity
+            android:name=".OAuthCallbackActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:theme="@style/Theme.NetBird.Transparent">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <!-- Primary: sdvpn:// custom scheme -->
+                <data
+                    android:scheme="sdvpn"
+                    android:host="oauth"
+                    android:path="/callback" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <!-- Alternative: io.schoolday.vpn for verified app links -->
+                <data
+                    android:scheme="https"
+                    android:host="vpn.schoolday.io"
+                    android:path="/oauth/callback" />
+            </intent-filter>
+        </activity>
     </application>
 
 </manifest>

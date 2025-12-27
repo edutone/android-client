@@ -61,4 +61,14 @@
     <style name="AlertDialogTheme" parent="Theme.AppCompat.Dialog.Alert">
         <item name="android:windowBackground">@android:color/transparent</item>
     </style>
+
+    <!-- Transparent theme for OAuth callback activity (no UI flash) -->
+    <style name="Theme.NetBird.Transparent" parent="Theme.NetBird.NoActionBar">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowIsFloating">true</item>
+        <item name="android:backgroundDimEnabled">false</item>
+    </style>
 </resources>
