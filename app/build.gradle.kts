@@ -20,10 +20,10 @@ fun getPropertyOrEnv(propertyName: String, envName: String = propertyName): Stri
 android {
     signingConfigs {
         create("release") {
-            val storeFile = getPropertyOrEnv("NETBIRD_UPLOAD_STORE_FILE")
-            val storePassword = getPropertyOrEnv("NETBIRD_UPLOAD_STORE_PASSWORD")
-            val keyAlias = getPropertyOrEnv("NETBIRD_UPLOAD_KEY_ALIAS")
-            val keyPassword = getPropertyOrEnv("NETBIRD_UPLOAD_KEY_PASSWORD")
+            val storeFile = getPropertyOrEnv("SCHOOLDAY_UPLOAD_STORE_FILE") ?: getPropertyOrEnv("NETBIRD_UPLOAD_STORE_FILE")
+            val storePassword = getPropertyOrEnv("SCHOOLDAY_UPLOAD_STORE_PASSWORD") ?: getPropertyOrEnv("NETBIRD_UPLOAD_STORE_PASSWORD")
+            val keyAlias = getPropertyOrEnv("SCHOOLDAY_UPLOAD_KEY_ALIAS") ?: getPropertyOrEnv("NETBIRD_UPLOAD_KEY_ALIAS")
+            val keyPassword = getPropertyOrEnv("SCHOOLDAY_UPLOAD_KEY_PASSWORD") ?: getPropertyOrEnv("NETBIRD_UPLOAD_KEY_PASSWORD")
 
             if (storeFile != null) {
                 this.storeFile = file(storeFile)
@@ -38,7 +38,8 @@ android {
     compileSdk = rootProject.extra["compileSdkVersion"] as Int
 
     defaultConfig {
-        applicationId = "io.netbird.client"
+        // SchoolDay Privacy VPN application ID
+        applicationId = "io.schoolday.vpn"
         minSdk = rootProject.extra["minSdkVersion"] as Int
         targetSdk = rootProject.extra["targetSdkVersion"] as Int
         versionCode = rootProject.extra["appVersionCode"] as Int

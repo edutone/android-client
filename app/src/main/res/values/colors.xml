@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- Material Design base colors -->
     <color name="purple_200">#FFBB86FC</color>
     <color name="purple_500">#FF6200EE</color>
     <color name="purple_700">#FF3700B3</color>
@@ -8,22 +9,45 @@
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
 
-    <color name="nb_bg">#F2F2F2</color>
-    <color name="nb_bg_peers">#F5F5F5</color>
-    <color name="nb_bg_home">#DEDEDE</color>
-    <color name="nb_bg_mask">#F2F2F2</color>
+    <!-- SchoolDay Primary Colors - Trust Blue -->
+    <color name="sd_primary">#1976D2</color>
+    <color name="sd_primary_dark">#0D47A1</color>
+    <color name="sd_primary_light">#42A5F5</color>
+
+    <!-- SchoolDay Accent Colors - Privacy Green -->
+    <color name="sd_accent">#00897B</color>
+    <color name="sd_accent_dark">#00695C</color>
+    <color name="sd_accent_light">#26A69A</color>
+
+    <!-- SchoolDay Status Colors -->
+    <color name="sd_connected">#4CAF50</color>
+    <color name="sd_connecting">#FFC107</color>
+    <color name="sd_disconnected">#9E9E9E</color>
+    <color name="sd_error">#F44336</color>
+    <color name="sd_protected">#00C853</color>
+
+    <!-- Background colors (keeping nb_ prefix for compatibility) -->
+    <color name="nb_bg">#F5F7FA</color>
+    <color name="nb_bg_peers">#FFFFFF</color>
+    <color name="nb_bg_home">#E3F2FD</color>
+    <color name="nb_bg_mask">#F5F7FA</color>
     <color name="nb_gray_light">#F5F5F5</color>
     <color name="nb_gray_dark">#4E4E4E</color>
-    <color name="nb_gray_bg">#eeeeee</color>
-    <color name="nb_gray_separator">#dadada</color>
-    <color name="nb_gray_border">#ececec</color>
-    <color name="nb_orange">#F58431</color>
-    <color name="nb_txt">#454545</color>
-    <color name="nb_txt_light">#7c7c7c</color>
-    <color name="nb_button_inactive">#4E4E4E</color>
+    <color name="nb_gray_bg">#FAFAFA</color>
+    <color name="nb_gray_separator">#E0E0E0</color>
+    <color name="nb_gray_border">#EEEEEE</color>
 
-    <color name="thumb_on_color">#F58431</color>
+    <!-- Replace NetBird orange with SchoolDay blue -->
+    <color name="nb_orange">#1976D2</color>
+
+    <!-- Text colors -->
+    <color name="nb_txt">#212121</color>
+    <color name="nb_txt_light">#757575</color>
+    <color name="nb_button_inactive">#9E9E9E</color>
+
+    <!-- Toggle switch colors - SchoolDay blue -->
+    <color name="thumb_on_color">#1976D2</color>
     <color name="thumb_off_color">#FFFFFF</color>
-    <color name="track_on_color">#89F58431</color>
+    <color name="track_on_color">#891976D2</color>
     <color name="track_off_color">#40000000</color>
 </resources>
