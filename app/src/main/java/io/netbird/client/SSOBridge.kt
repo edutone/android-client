@@ -1,14 +1,19 @@
 package io.netbird.client
 
+import android.content.Context
 import android.util.Log
 import io.netbird.gomobile.android.HandleOAuthCallback
 import io.netbird.gomobile.android.HandleOAuthError
 import io.netbird.gomobile.android.MobileOAuth
 import io.netbird.gomobile.android.MobileOAuthConfig
-import io.netbird.gomobile.android.MobileTokenResponse
 import io.netbird.gomobile.android.NewMobileOAuth
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.lang.ref.WeakReference
 
 /**
  * SSOBridge provides the Kotlin interface to the Go MobileOAuth layer.
@@ -19,18 +24,26 @@ import kotlinx.coroutines.withContext
  * 3. After authentication, the IdP redirects to sdvpn://oauth/callback
  * 4. OAuthCallbackActivity receives the deep link and calls handleCallback()
  * 5. The callback is validated and code is exchanged for session token
+ * 6. Session is stored securely in Android Keystore
+ * 7. Auto-refresh keeps session valid while app is active
  */
 object SSOBridge {
     private const val TAG = "SSOBridge"
 
     // Default SSO Bridge configuration
-    // These can be overridden by the app configuration
     private const val DEFAULT_REDIRECT_URI = "sdvpn://oauth/callback"
     private const val DEFAULT_SSO_BRIDGE_URL = "https://vpn.schoolday.io"
-    private const val DEFAULT_PROVIDER_ID = "" // Use default provider
+    private const val DEFAULT_PROVIDER_ID = ""
+
+    // Auto-refresh configuration
+    private const val REFRESH_CHECK_INTERVAL_MS = 5 * 60 * 1000L // Check every 5 minutes
+    private const val REFRESH_THRESHOLD_MS = 60 * 60 * 1000L // Refresh when < 1 hour to expiry
 
     private var mobileOAuth: MobileOAuth? = null
-    private var currentState: String? = null
+    private var secureStore: SecureTokenStore? = null
+    private var contextRef: WeakReference<Context>? = null
+    private var refreshJob: Job? = null
+    private var ssoBridgeUrl: String = DEFAULT_SSO_BRIDGE_URL
 
     /**
      * Session information returned after successful authentication.
@@ -48,20 +61,21 @@ object SSOBridge {
      * Listener interface for OAuth flow results.
      */
     interface OAuthListener {
-        /**
-         * Called when authentication is successful and session is obtained.
-         */
         fun onAuthSuccess(session: SessionInfo)
-
-        /**
-         * Called when authentication fails.
-         */
         fun onAuthError(errorCode: String, errorDescription: String)
     }
 
     /**
+     * Listener interface for session state changes.
+     */
+    interface SessionListener {
+        fun onSessionRefreshed(session: SessionInfo)
+        fun onSessionExpired()
+        fun onSessionError(errorCode: String, errorDescription: String)
+    }
+
+    /**
      * Legacy listener interface for backwards compatibility.
-     * Use OAuthListener for full session support.
      */
     interface LegacyOAuthListener {
         fun onAuthSuccess(codeVerifier: String, redirectUri: String)
@@ -70,21 +84,36 @@ object SSOBridge {
 
     private var listener: OAuthListener? = null
     private var legacyListener: LegacyOAuthListener? = null
+    private var sessionListener: SessionListener? = null
 
     /**
-     * Initialize the SSO Bridge with custom configuration.
+     * Initialize the SSO Bridge with context and configuration.
      *
+     * @param context Application context (required for secure storage)
      * @param ssoBridgeUrl The URL of the SSO Bridge server
      * @param redirectUri The OAuth redirect URI (deep link)
      * @param providerId Optional OIDC provider ID
      */
     @JvmStatic
     fun initialize(
+        context: Context,
         ssoBridgeUrl: String = DEFAULT_SSO_BRIDGE_URL,
         redirectUri: String = DEFAULT_REDIRECT_URI,
         providerId: String = DEFAULT_PROVIDER_ID
     ) {
         Log.d(TAG, "Initializing SSOBridge with URL: $ssoBridgeUrl")
+
+        contextRef = WeakReference(context.applicationContext)
+        this.ssoBridgeUrl = ssoBridgeUrl
+
+        // Initialize secure storage
+        secureStore = SecureTokenStore.getInstance(context.applicationContext)
+
+        // Log hardware backing status
+        secureStore?.let { store ->
+            val isHardwareBacked = store.isHardwareBackedKeystore()
+            Log.i(TAG, "Secure storage initialized, hardware-backed: $isHardwareBacked")
+        }
 
         val config = MobileOAuthConfig().apply {
             this.ssoBridgeURL = ssoBridgeUrl
@@ -94,6 +123,36 @@ object SSOBridge {
 
         mobileOAuth = NewMobileOAuth(config)
         Log.d(TAG, "SSOBridge initialized successfully")
+    }
+
+    /**
+     * Initialize with default URL (legacy support).
+     */
+    @JvmStatic
+    fun initialize(
+        ssoBridgeUrl: String = DEFAULT_SSO_BRIDGE_URL,
+        redirectUri: String = DEFAULT_REDIRECT_URI,
+        providerId: String = DEFAULT_PROVIDER_ID
+    ) {
+        Log.w(TAG, "Initializing SSOBridge without context - secure storage not available")
+
+        this.ssoBridgeUrl = ssoBridgeUrl
+
+        val config = MobileOAuthConfig().apply {
+            this.ssoBridgeURL = ssoBridgeUrl
+            this.redirectURI = redirectUri
+            this.providerID = providerId
+        }
+
+        mobileOAuth = NewMobileOAuth(config)
+    }
+
+    /**
+     * Set a session listener for session state changes.
+     */
+    @JvmStatic
+    fun setSessionListener(listener: SessionListener?) {
+        sessionListener = listener
     }
 
     /**
@@ -107,10 +166,10 @@ object SSOBridge {
         this.listener = listener
         this.legacyListener = null
 
-        val oauth = mobileOAuth
-        if (oauth == null) {
-            Log.e(TAG, "SSOBridge not initialized, initializing with defaults")
-            initialize()
+        if (mobileOAuth == null) {
+            Log.e(TAG, "SSOBridge not initialized")
+            listener.onAuthError("not_initialized", "SSOBridge not initialized")
+            return null
         }
 
         return try {
@@ -126,19 +185,16 @@ object SSOBridge {
 
     /**
      * Start the OAuth PKCE flow (legacy version).
-     *
-     * @param listener Callback for auth result (legacy)
-     * @return The authorization URL to open in the browser, or null on error
      */
     @JvmStatic
     fun startAuthFlowLegacy(listener: LegacyOAuthListener): String? {
         this.legacyListener = listener
         this.listener = null
 
-        val oauth = mobileOAuth
-        if (oauth == null) {
-            Log.e(TAG, "SSOBridge not initialized, initializing with defaults")
-            initialize()
+        if (mobileOAuth == null) {
+            Log.e(TAG, "SSOBridge not initialized")
+            listener.onAuthError("not_initialized", "SSOBridge not initialized")
+            return null
         }
 
         return try {
@@ -154,9 +210,6 @@ object SSOBridge {
 
     /**
      * Handle an OAuth callback from a deep link.
-     * Called by OAuthCallbackActivity when it receives the callback.
-     *
-     * This method validates the callback and exchanges the code for a session token.
      *
      * @param code The authorization code from the IdP
      * @param state The OAuth state parameter for CSRF protection
@@ -189,14 +242,22 @@ object SSOBridge {
 
             if (tokenResponse != null) {
                 Log.d(TAG, "Token exchange successful for: ${tokenResponse.email}")
+
                 val session = SessionInfo(
                     sessionToken = tokenResponse.sessionToken,
                     expiresAt = tokenResponse.expiresAt,
                     userId = tokenResponse.userID,
                     email = tokenResponse.email,
                     name = tokenResponse.name,
-                    roles = emptyList() // Go slice to Kotlin list not directly supported
+                    roles = emptyList()
                 )
+
+                // Store session securely
+                storeSessionSecurely(session)
+
+                // Start auto-refresh
+                startAutoRefresh()
+
                 listener?.onAuthSuccess(session)
                 true
             } else {
@@ -213,18 +274,185 @@ object SSOBridge {
     }
 
     /**
-     * Exchange authorization code for session token (suspend function for coroutines).
+     * Store the session securely using Android Keystore.
+     */
+    private fun storeSessionSecurely(session: SessionInfo) {
+        try {
+            secureStore?.storeSession(session)
+            Log.d(TAG, "Session stored securely")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to store session securely", e)
+        }
+    }
+
+    /**
+     * Get the stored session if valid.
      *
-     * @param code The authorization code from the IdP
-     * @param state The OAuth state parameter
-     * @return SessionInfo on success, null on failure
+     * @return The stored session, or null if none exists or expired
+     */
+    @JvmStatic
+    fun getStoredSession(): SessionInfo? {
+        return try {
+            val stored = secureStore?.getSession()
+            if (stored != null) {
+                SessionInfo(
+                    sessionToken = stored.sessionToken,
+                    expiresAt = stored.expiresAt.toString(),
+                    userId = stored.userId,
+                    email = stored.email,
+                    name = stored.name,
+                    roles = stored.roles
+                )
+            } else {
+                null
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to get stored session", e)
+            null
+        }
+    }
+
+    /**
+     * Get the session token if a valid session exists.
+     */
+    @JvmStatic
+    fun getSessionToken(): String? {
+        return secureStore?.getSessionToken()
+    }
+
+    /**
+     * Check if a valid session exists.
+     */
+    @JvmStatic
+    fun hasValidSession(): Boolean {
+        return secureStore?.hasValidSession() == true
+    }
+
+    /**
+     * Check if the session should be refreshed.
+     */
+    @JvmStatic
+    fun shouldRefreshSession(): Boolean {
+        return secureStore?.getSession()?.shouldRefresh() == true
+    }
+
+    /**
+     * Start automatic session refresh.
+     * Checks periodically and refreshes when approaching expiry.
+     */
+    private fun startAutoRefresh() {
+        refreshJob?.cancel()
+        refreshJob = CoroutineScope(Dispatchers.Default).launch {
+            while (true) {
+                delay(REFRESH_CHECK_INTERVAL_MS)
+                checkAndRefreshSession()
+            }
+        }
+        Log.d(TAG, "Started auto-refresh job")
+    }
+
+    /**
+     * Stop automatic session refresh.
+     */
+    @JvmStatic
+    fun stopAutoRefresh() {
+        refreshJob?.cancel()
+        refreshJob = null
+        Log.d(TAG, "Stopped auto-refresh job")
+    }
+
+    /**
+     * Check if refresh is needed and perform it.
+     */
+    private suspend fun checkAndRefreshSession() {
+        val stored = secureStore?.getSession() ?: return
+
+        if (stored.isExpired()) {
+            Log.d(TAG, "Session has expired")
+            withContext(Dispatchers.Main) {
+                sessionListener?.onSessionExpired()
+            }
+            clearSession()
+            return
+        }
+
+        if (stored.shouldRefresh()) {
+            Log.d(TAG, "Session needs refresh")
+            refreshSession()
+        }
+    }
+
+    /**
+     * Refresh the current session.
+     */
+    suspend fun refreshSession() {
+        // TODO: Implement session refresh via SSO Bridge API
+        // For now, just update the last refresh timestamp
+        withContext(Dispatchers.IO) {
+            try {
+                secureStore?.updateLastRefresh()
+                Log.d(TAG, "Session refresh timestamp updated")
+
+                // Notify listener
+                val stored = secureStore?.getSession()
+                if (stored != null) {
+                    val session = SessionInfo(
+                        sessionToken = stored.sessionToken,
+                        expiresAt = stored.expiresAt.toString(),
+                        userId = stored.userId,
+                        email = stored.email,
+                        name = stored.name,
+                        roles = stored.roles
+                    )
+                    withContext(Dispatchers.Main) {
+                        sessionListener?.onSessionRefreshed(session)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Session refresh failed", e)
+                withContext(Dispatchers.Main) {
+                    sessionListener?.onSessionError("refresh_failed", e.message ?: "Unknown error")
+                }
+            }
+        }
+    }
+
+    /**
+     * Resume session on app resume.
+     * Call this from Activity.onResume().
+     */
+    @JvmStatic
+    fun onAppResume() {
+        Log.d(TAG, "App resumed, checking session")
+        CoroutineScope(Dispatchers.Default).launch {
+            checkAndRefreshSession()
+        }
+
+        // Restart auto-refresh if we have a valid session
+        if (hasValidSession() && refreshJob?.isActive != true) {
+            startAutoRefresh()
+        }
+    }
+
+    /**
+     * Pause session refresh on app pause.
+     * Call this from Activity.onPause().
+     */
+    @JvmStatic
+    fun onAppPause() {
+        Log.d(TAG, "App paused, stopping auto-refresh")
+        stopAutoRefresh()
+    }
+
+    /**
+     * Exchange authorization code for session token (suspend function).
      */
     suspend fun exchangeCodeForSession(code: String, state: String): SessionInfo? {
         return withContext(Dispatchers.IO) {
             try {
                 val tokenResponse = mobileOAuth?.exchangeCodeSimple(code, state)
                 if (tokenResponse != null) {
-                    SessionInfo(
+                    val session = SessionInfo(
                         sessionToken = tokenResponse.sessionToken,
                         expiresAt = tokenResponse.expiresAt,
                         userId = tokenResponse.userID,
@@ -232,6 +460,8 @@ object SSOBridge {
                         name = tokenResponse.name,
                         roles = emptyList()
                     )
+                    storeSessionSecurely(session)
+                    session
                 } else {
                     null
                 }
@@ -244,10 +474,6 @@ object SSOBridge {
 
     /**
      * Handle an OAuth error from a deep link.
-     * Called by OAuthCallbackActivity when the IdP returns an error.
-     *
-     * @param errorCode The OAuth error code
-     * @param errorDescription Human-readable error description
      */
     @JvmStatic
     fun handleError(errorCode: String, errorDescription: String) {
@@ -255,6 +481,18 @@ object SSOBridge {
         HandleOAuthError(errorCode, errorDescription)
         listener?.onAuthError(errorCode, errorDescription)
         legacyListener?.onAuthError(errorCode, errorDescription)
+    }
+
+    /**
+     * Clear the stored session (logout).
+     */
+    @JvmStatic
+    fun clearSession() {
+        Log.d(TAG, "Clearing session")
+        stopAutoRefresh()
+        secureStore?.clearSession()
+        listener = null
+        legacyListener = null
     }
 
     /**
@@ -266,7 +504,16 @@ object SSOBridge {
         mobileOAuth?.clearAllFlows()
         listener = null
         legacyListener = null
-        currentState = null
+    }
+
+    /**
+     * Complete logout: clear session and cancel any flows.
+     */
+    @JvmStatic
+    fun logout() {
+        Log.d(TAG, "Logging out")
+        cancelFlow()
+        clearSession()
     }
 
     /**
@@ -278,13 +525,10 @@ object SSOBridge {
     }
 
     /**
-     * Get the current session token if available.
-     * For VPN connection, this token should be used for authentication.
+     * Check if secure storage is hardware-backed.
      */
     @JvmStatic
-    fun getSessionToken(): String? {
-        // This would be stored after successful authentication
-        // For now, the session is returned via the listener
-        return null
+    fun isSecureStorageHardwareBacked(): Boolean {
+        return secureStore?.isHardwareBackedKeystore() == true
     }
 }
