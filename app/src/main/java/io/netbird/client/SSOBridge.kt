@@ -5,7 +5,10 @@ import io.netbird.gomobile.android.HandleOAuthCallback
 import io.netbird.gomobile.android.HandleOAuthError
 import io.netbird.gomobile.android.MobileOAuth
 import io.netbird.gomobile.android.MobileOAuthConfig
+import io.netbird.gomobile.android.MobileTokenResponse
 import io.netbird.gomobile.android.NewMobileOAuth
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * SSOBridge provides the Kotlin interface to the Go MobileOAuth layer.
@@ -15,7 +18,7 @@ import io.netbird.gomobile.android.NewMobileOAuth
  * 2. The app opens the URL in Chrome Custom Tab
  * 3. After authentication, the IdP redirects to sdvpn://oauth/callback
  * 4. OAuthCallbackActivity receives the deep link and calls handleCallback()
- * 5. The callback is processed in Go and tokens are obtained
+ * 5. The callback is validated and code is exchanged for session token
  */
 object SSOBridge {
     private const val TAG = "SSOBridge"
@@ -30,14 +33,43 @@ object SSOBridge {
     private var currentState: String? = null
 
     /**
+     * Session information returned after successful authentication.
+     */
+    data class SessionInfo(
+        val sessionToken: String,
+        val expiresAt: String,
+        val userId: String,
+        val email: String,
+        val name: String,
+        val roles: List<String>
+    )
+
+    /**
      * Listener interface for OAuth flow results.
      */
     interface OAuthListener {
+        /**
+         * Called when authentication is successful and session is obtained.
+         */
+        fun onAuthSuccess(session: SessionInfo)
+
+        /**
+         * Called when authentication fails.
+         */
+        fun onAuthError(errorCode: String, errorDescription: String)
+    }
+
+    /**
+     * Legacy listener interface for backwards compatibility.
+     * Use OAuthListener for full session support.
+     */
+    interface LegacyOAuthListener {
         fun onAuthSuccess(codeVerifier: String, redirectUri: String)
         fun onAuthError(errorCode: String, errorDescription: String)
     }
 
     private var listener: OAuthListener? = null
+    private var legacyListener: LegacyOAuthListener? = null
 
     /**
      * Initialize the SSO Bridge with custom configuration.
@@ -65,14 +97,15 @@ object SSOBridge {
     }
 
     /**
-     * Start the OAuth PKCE flow.
+     * Start the OAuth PKCE flow with full session support.
      *
-     * @param listener Callback for auth result
+     * @param listener Callback for auth result with session info
      * @return The authorization URL to open in the browser, or null on error
      */
     @JvmStatic
     fun startAuthFlow(listener: OAuthListener): String? {
         this.listener = listener
+        this.legacyListener = null
 
         val oauth = mobileOAuth
         if (oauth == null) {
@@ -92,8 +125,38 @@ object SSOBridge {
     }
 
     /**
+     * Start the OAuth PKCE flow (legacy version).
+     *
+     * @param listener Callback for auth result (legacy)
+     * @return The authorization URL to open in the browser, or null on error
+     */
+    @JvmStatic
+    fun startAuthFlowLegacy(listener: LegacyOAuthListener): String? {
+        this.legacyListener = listener
+        this.listener = null
+
+        val oauth = mobileOAuth
+        if (oauth == null) {
+            Log.e(TAG, "SSOBridge not initialized, initializing with defaults")
+            initialize()
+        }
+
+        return try {
+            val authUrl = mobileOAuth?.startAuthFlowSimple()
+            Log.d(TAG, "Started OAuth flow (legacy), auth URL: ${authUrl?.take(50)}...")
+            authUrl
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start auth flow", e)
+            listener.onAuthError("start_failed", e.message ?: "Unknown error")
+            null
+        }
+    }
+
+    /**
      * Handle an OAuth callback from a deep link.
      * Called by OAuthCallbackActivity when it receives the callback.
+     *
+     * This method validates the callback and exchanges the code for a session token.
      *
      * @param code The authorization code from the IdP
      * @param state The OAuth state parameter for CSRF protection
@@ -104,24 +167,78 @@ object SSOBridge {
         Log.d(TAG, "Handling OAuth callback - code length: ${code.length}, state: ${state.take(8)}...")
 
         return try {
-            val oauthState = HandleOAuthCallback(code, state)
+            // For legacy flow, just validate and return
+            if (legacyListener != null) {
+                val oauthState = HandleOAuthCallback(code, state)
+                if (oauthState != null) {
+                    Log.d(TAG, "OAuth callback validated successfully (legacy)")
+                    legacyListener?.onAuthSuccess(
+                        oauthState.codeVerifier,
+                        oauthState.redirectURI
+                    )
+                    return true
+                } else {
+                    Log.e(TAG, "OAuth callback returned null state")
+                    legacyListener?.onAuthError("invalid_state", "OAuth state validation failed")
+                    return false
+                }
+            }
 
-            if (oauthState != null) {
-                Log.d(TAG, "OAuth callback validated successfully")
-                listener?.onAuthSuccess(
-                    oauthState.codeVerifier,
-                    oauthState.redirectURI
+            // For full flow, exchange code for session token
+            val tokenResponse = mobileOAuth?.exchangeCodeSimple(code, state)
+
+            if (tokenResponse != null) {
+                Log.d(TAG, "Token exchange successful for: ${tokenResponse.email}")
+                val session = SessionInfo(
+                    sessionToken = tokenResponse.sessionToken,
+                    expiresAt = tokenResponse.expiresAt,
+                    userId = tokenResponse.userID,
+                    email = tokenResponse.email,
+                    name = tokenResponse.name,
+                    roles = emptyList() // Go slice to Kotlin list not directly supported
                 )
+                listener?.onAuthSuccess(session)
                 true
             } else {
-                Log.e(TAG, "OAuth callback returned null state")
-                listener?.onAuthError("invalid_state", "OAuth state validation failed")
+                Log.e(TAG, "Token exchange returned null")
+                listener?.onAuthError("token_exchange_failed", "Failed to exchange code for session")
                 false
             }
         } catch (e: Exception) {
-            Log.e(TAG, "OAuth callback failed", e)
+            Log.e(TAG, "OAuth callback/token exchange failed", e)
             listener?.onAuthError("callback_failed", e.message ?: "Unknown error")
+            legacyListener?.onAuthError("callback_failed", e.message ?: "Unknown error")
             false
+        }
+    }
+
+    /**
+     * Exchange authorization code for session token (suspend function for coroutines).
+     *
+     * @param code The authorization code from the IdP
+     * @param state The OAuth state parameter
+     * @return SessionInfo on success, null on failure
+     */
+    suspend fun exchangeCodeForSession(code: String, state: String): SessionInfo? {
+        return withContext(Dispatchers.IO) {
+            try {
+                val tokenResponse = mobileOAuth?.exchangeCodeSimple(code, state)
+                if (tokenResponse != null) {
+                    SessionInfo(
+                        sessionToken = tokenResponse.sessionToken,
+                        expiresAt = tokenResponse.expiresAt,
+                        userId = tokenResponse.userID,
+                        email = tokenResponse.email,
+                        name = tokenResponse.name,
+                        roles = emptyList()
+                    )
+                } else {
+                    null
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Token exchange failed", e)
+                null
+            }
         }
     }
 
@@ -137,6 +254,7 @@ object SSOBridge {
         Log.e(TAG, "OAuth error: $errorCode - $errorDescription")
         HandleOAuthError(errorCode, errorDescription)
         listener?.onAuthError(errorCode, errorDescription)
+        legacyListener?.onAuthError(errorCode, errorDescription)
     }
 
     /**
@@ -147,6 +265,7 @@ object SSOBridge {
         Log.d(TAG, "Cancelling OAuth flow")
         mobileOAuth?.clearAllFlows()
         listener = null
+        legacyListener = null
         currentState = null
     }
 
@@ -155,6 +274,17 @@ object SSOBridge {
      */
     @JvmStatic
     fun isFlowInProgress(): Boolean {
-        return listener != null
+        return listener != null || legacyListener != null
+    }
+
+    /**
+     * Get the current session token if available.
+     * For VPN connection, this token should be used for authentication.
+     */
+    @JvmStatic
+    fun getSessionToken(): String? {
+        // This would be stored after successful authentication
+        // For now, the session is returned via the listener
+        return null
     }
 }
